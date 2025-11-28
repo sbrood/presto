@@ -6,7 +6,6 @@ with open("README.md", "r", encoding="utf-8") as fh:
 long_description = "\n".join(
     [line for line in long_description.split("\n") if not line.startswith("<img")]
 )
-
 setup(
     name="presto",
     description="Pretrained Remote Sensing Transformer",
@@ -27,12 +26,13 @@ setup(
         "matplotlib",
         "numpy",
         "torch",
-        "tqdm==4.64.1",
+        "tqdm>=4.64.1",
         "webdataset==0.2.31",
         "google-cloud-storage==2.2.1",
         "earthengine-api==0.1.334",
         "hurry.filesize==0.9",
         "rioxarray==0.13.1",
+        "xarray>=2024.1.0",
     ],
     python_requires=">=3.9",
     include_package_data=True,
