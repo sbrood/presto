@@ -14,7 +14,7 @@ from torch.nn import functional as F
 from .dataops.pipelines.dynamicworld import DynamicWorld2020_2021
 from .dataops.pipelines.s1_s2_era5_srtm import BANDS_GROUPS_IDX
 from .model import FinetuningHead, FineTuningModel, Seq2Seq
-from .utils import default_model_path, device
+from .utils import default_model_path
 
 my_logger = logging.getLogger(__name__)
 
@@ -226,7 +226,9 @@ class Block(nn.Module):
         return x
 
 
-def get_sinusoid_encoding_table(positions, d_hid, T=1000):
+def get_sinusoid_encoding_table(
+    positions, d_hid, T=1000, device: Optional[torch.device] = None
+):
     """Sinusoid position encoding table
     positions: int or list of integer, if int range(positions)"""
 
@@ -244,10 +246,10 @@ def get_sinusoid_encoding_table(positions, d_hid, T=1000):
     sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
     sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
 
-    return torch.FloatTensor(sinusoid_table).to(device)
+    return torch.tensor(sinusoid_table, dtype=torch.float, device=device)
 
 
-def get_month_encoding_table(d_hid):
+def get_month_encoding_table(d_hid, device: Optional[torch.device] = None):
     """Sinusoid month encoding table, for 12 months indexed from 0-11"""
     assert d_hid % 2 == 0
     angles = np.arange(0, 13) / (12 / (2 * np.pi))
@@ -256,13 +258,23 @@ def get_month_encoding_table(d_hid):
     cos_table = np.cos(np.stack([angles for _ in range(d_hid // 2)], axis=-1))
     month_table = np.concatenate([sin_table[:-1], cos_table[:-1]], axis=-1)
 
-    if torch.cuda.is_available():
-        return torch.FloatTensor(month_table).cuda()
-    else:
-        return torch.FloatTensor(month_table)
+    return torch.tensor(month_table, dtype=torch.float, device=device)
 
 
-def month_to_tensor(month: Union[torch.Tensor, int], batch_size: int, seq_len: int):
+def month_to_tensor(
+    month: Union[torch.Tensor, int],
+    batch_size: int,
+    seq_len: int,
+    device: Optional[Union[str, torch.device]] = None,
+) -> torch.Tensor:
+    target_device: Optional[torch.device] = (
+        month.device if isinstance(month, torch.Tensor) else None
+    )
+    if target_device is None and device is not None:
+        target_device = torch.device(device)
+    if target_device is None:
+        target_device = torch.device("cpu")
+
     if isinstance(month, int):
         assert cast(int, month) < 12
     else:
@@ -271,18 +283,26 @@ def month_to_tensor(month: Union[torch.Tensor, int], batch_size: int, seq_len: i
     if isinstance(month, int):
         # >>> torch.fmod(torch.tensor([9., 10, 11, 12, 13, 14]), 12)
         # tensor([ 9., 10., 11.,  0.,  1.,  2.])
-        month = (
-            torch.fmod(torch.arange(month, month + seq_len, dtype=torch.long), 12)
-            .expand(batch_size, seq_len)
-            .to(device)
-        )
+        month = torch.fmod(
+            torch.arange(
+                month, month + seq_len, dtype=torch.long, device=target_device
+            ),
+            12,
+        ).expand(batch_size, seq_len)
     elif len(month.shape) == 1:
         month = torch.stack(
             [
-                torch.fmod(torch.arange(m, m + seq_len, dtype=torch.long), 12)
+                torch.fmod(
+                    torch.arange(
+                        m, m + seq_len, dtype=torch.long, device=target_device
+                    ),
+                    12,
+                )
                 for m in month
             ]
-        ).to(device)
+        ).to(target_device)
+    else:
+        month = month.to(target_device)
     return month
 
 
@@ -347,7 +367,9 @@ class Encoder(nn.Module):
         self.pos_embed = nn.Parameter(
             torch.zeros(1, max_sequence_length, pos_embedding_size), requires_grad=False
         )
-        month_tab = get_month_encoding_table(month_embedding_size)
+        month_tab = get_month_encoding_table(
+            month_embedding_size, device=self.pos_embed.device
+        )
         self.month_embed = nn.Embedding.from_pretrained(month_tab, freeze=True)
         self.channel_embed = nn.Embedding(
             num_embeddings=len(self.band_groups) + 1,
@@ -358,7 +380,9 @@ class Encoder(nn.Module):
 
     def initialize_weights(self):
         pos_embed = get_sinusoid_encoding_table(
-            self.pos_embed.shape[1], self.pos_embed.shape[-1]
+            self.pos_embed.shape[1],
+            self.pos_embed.shape[-1],
+            device=self.pos_embed.device,
         )
         self.pos_embed.data.copy_(pos_embed)
 
@@ -401,7 +425,9 @@ class Encoder(nn.Module):
 
         # we want the mask to just be the indices of the masked tokens
         indices = repeat(
-            torch.arange(0, x.shape[1]).long().to(device), "d -> b d", b=x.shape[0]
+            torch.arange(0, x.shape[1], device=x.device).long(),
+            "d -> b d",
+            b=x.shape[0],
         )
 
         x = x[~mask.bool()].view(batch_size, kept_elements_per_batch, embedding_dim)
@@ -423,11 +449,14 @@ class Encoder(nn.Module):
         month: Union[torch.Tensor, int] = 0,
         eval_task: bool = True,
         no_mean: bool = False,
+        device: Optional[str] = None,  # to enable ddp when using as library
     ):
+        if device is None:
+            device = x.device
         if mask is None:
-            mask = torch.zeros_like(x, device=x.device).float()
+            mask = torch.zeros_like(x, device=device).float()
         my_logger.debug(f"init x {x.shape}")
-        months = month_to_tensor(month, x.shape[0], x.shape[1])
+        months = month_to_tensor(month, x.shape[0], x.shape[1], device=device)
         my_logger.debug(f"months {months.shape}\n {months}")
         month_embedding = self.month_embed(months)
         positional_embedding = repeat(
@@ -443,7 +472,9 @@ class Encoder(nn.Module):
         for channel_group, channel_idxs in self.band_groups.items():
             tokens = self.eo_patch_embed[channel_group](x[:, :, channel_idxs])
             channel_embedding = self.channel_embed(
-                torch.tensor(self.band_group_to_idx[channel_group]).long().to(device)
+                torch.tensor(
+                    self.band_group_to_idx[channel_group], device=device
+                ).long()
             )
             channel_embedding = repeat(
                 channel_embedding, "d -> b t d", b=x.shape[0], t=x.shape[1]
@@ -480,7 +511,7 @@ class Encoder(nn.Module):
         my_logger.debug(f"dw {dynamic_world}")
         tokens = self.dw_embed(dynamic_world)
         channel_embedding = self.channel_embed(
-            torch.tensor(self.band_group_to_idx["dynamic_world"]).long().to(device)
+            torch.tensor(self.band_group_to_idx["dynamic_world"], device=device).long()
         )
         channel_embedding = repeat(
             channel_embedding, "d -> b t d", b=x.shape[0], t=x.shape[1]
@@ -583,14 +614,18 @@ class Decoder(nn.Module):
             torch.zeros(1, max_sequence_length, int(remaining_embeddings) // 2),
             requires_grad=False,
         )
-        month_tab = get_month_encoding_table(int(remaining_embeddings) // 2)
+        month_tab = get_month_encoding_table(
+            int(remaining_embeddings) // 2, device=self.pos_embed.device
+        )
         self.month_embed = nn.Embedding.from_pretrained(month_tab, freeze=True)
 
         self.initialize_weights()
 
     def initialize_weights(self):
         pos_embed = get_sinusoid_encoding_table(
-            self.pos_embed.shape[1], self.pos_embed.shape[-1]
+            self.pos_embed.shape[1],
+            self.pos_embed.shape[-1],
+            device=self.pos_embed.device,
         )
         self.pos_embed.data.copy_(pos_embed)
 
@@ -633,7 +668,7 @@ class Decoder(nn.Module):
         # channel group doesn't have timesteps
         num_timesteps = int((x.shape[1] - 2) / (num_channel_groups - 1))
         srtm_index = self.band_group_to_idx["SRTM"] * num_timesteps
-        months = month_to_tensor(month, x.shape[0], num_timesteps)
+        months = month_to_tensor(month, x.shape[0], num_timesteps, device=x.device)
 
         # when we expand the encodings, each channel_group gets num_timesteps
         # encodings. However, there is only one SRTM token so we remove the
@@ -832,12 +867,16 @@ class Presto(Seq2Seq):
             hidden_size=self.encoder.embedding_size,
             regression=regression,
         )
-        model = PrestoFineTuningModel(self.encoder, head).to(device)
+        model = PrestoFineTuningModel(self.encoder, head)
         model.train()
         return model
 
     @classmethod
-    def load_pretrained(cls, model_path: Union[str, Path] = default_model_path):
+    def load_pretrained(
+        cls,
+        model_path: Union[str, Path] = default_model_path,
+        map_location: Optional[Union[str, torch.device]] = "cpu",
+    ):
         model = cls.construct()
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        return model.to(device)
+        model.load_state_dict(torch.load(model_path, map_location=map_location))
+        return model
