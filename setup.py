@@ -21,7 +21,7 @@ setup(
     ],
     packages=["presto"] + [f"presto.{f}" for f in find_packages("presto")],
     install_requires=[
-        "einops==0.6.0",
+        "einops>=0.6.1",
         "h5py",
         "matplotlib",
         "numpy",
